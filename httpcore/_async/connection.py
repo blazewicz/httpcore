@@ -141,8 +141,8 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                         # TODO: Take host from altsvc, if provided
                         host = self._origin.host.decode("ascii")
                         port = int(m_h3.group(1))
-                        # stream = await self._network_backend.connect_udp(host, port)
-                        stream = (host, port)
+                        stream = await self._network_backend.connect_udp(host, port)
+                        # stream = (host, port)
                         self._connection = AsyncHTTP3Connection(
                             origin=self._origin,
                             stream=stream,

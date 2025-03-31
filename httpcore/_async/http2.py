@@ -384,9 +384,6 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                             await self._receive_remote_settings_change(event)
                             trace.return_value = event
 
-                    elif isinstance(event, h2.events.AlternativeServiceAvailable):
-                        logger.info("ALTSVC received: %s", event)
-
                     elif isinstance(
                         event,
                         (

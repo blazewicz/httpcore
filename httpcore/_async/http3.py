@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import time
 import enum
 import logging
-from typing import Dict, Optional, AsyncIterator
+from collections import deque, defaultdict
+from typing import Dict, AsyncIterator, Deque, Tuple
 
-from aioquic.asyncio.client import connect
-from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h3.connection import H3_ALPN, ErrorCode, H3Connection
 from aioquic.h3.events import (
     DataReceived,
@@ -15,7 +13,9 @@ from aioquic.h3.events import (
     HeadersReceived,
 )
 from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.connection import QuicConnection, QuicErrorCode
 from aioquic.quic.events import QuicEvent
+from aioquic.quic import events as quic_events
 from aioquic.quic.logger import QuicFileLogger
 from aioquic.quic.packet import QuicProtocolVersion
 from aioquic.tls import CipherSuite, SessionTicket
@@ -27,7 +27,13 @@ from .._exceptions import (
     RemoteProtocolError,
 )
 from .._models import Origin, Request, Response
-from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
+from .._synchronization import (
+    AsyncLock,
+    AsyncSemaphore,
+    AsyncShieldCancellation,
+    AsyncStream,
+    AsyncEvent,
+)
 from .._trace import Trace
 from .interfaces import AsyncConnectionInterface
 
@@ -40,115 +46,83 @@ class HTTPConnectionState(enum.IntEnum):
     CLOSED = 3
 
 
-class HTTP3ResponseHandler:
-    def __init__(self, connection: "ConnectionProtocol", stream_id: int):
-        self._connection = connection
-        self._stream_id = stream_id
+class AsyncHTTP3Connection(AsyncConnectionInterface):
+    def __init__(
+        self,
+        origin: Origin,
+        stream: AsyncNetworkStream,
+        keepalive_expiry: float | None = None,
+    ):
+        self._origin = origin
+        self._network_stream = stream
+        self._keepalive_expiry: float | None = keepalive_expiry
+        self._state = HTTPConnectionState.IDLE
+        self._expire_at: float | None = None
+        self._request_count = 0
 
-        self._status: int | None = None
-        self._headers: Dict[bytes, bytes] = {}
-        self._queue: "asyncio.Queue[bytes]" = asyncio.Queue()
-        self._no_content = False
-        self._ready = asyncio.Event()
-        self._closed = False
+        self._connect_lock = AsyncLock()
+        self._read_lock = AsyncLock()
+        self._write_lock = AsyncLock()
 
-    def http_event_received(self, event: DataReceived | HeadersReceived) -> None:
-        if isinstance(event, HeadersReceived):
-            logger.info("H3 headers: %s", event.headers)
-            for k, v in event.headers:
-                if k == b":status":
-                    self._status = int(v)
-                if not k.startswith(b":"):
-                    self._headers[k] = v
-
-            self._ready.set()
-            if event.stream_ended:
-                self._no_content = True
-
-        elif isinstance(event, DataReceived):
-            self._queue.put_nowait(event.data)
-            if event.stream_ended:
-                self._queue.put_nowait(b"")
-
-    async def build(self) -> Response:
-        await self._ready.wait()
-        assert self._status is not None
-        return Response(
-            status=self._status,
-            headers=self._headers,
-            content=None if self._no_content else self,
-            extensions={
-                b"http_version": b"HTTP/3",
-                b"stream_id": self._stream_id,
-            },
+        self._addr: str = ""
+        self._quic_configuration = QuicConfiguration(
+            is_client=True,
+            alpn_protocols=H3_ALPN,
+            congestion_control_algorithm="reno",
+            original_version=QuicProtocolVersion.VERSION_1,
+            supported_versions=[
+                QuicProtocolVersion.VERSION_1,
+                QuicProtocolVersion.VERSION_2,
+            ],
+            # idle_timeout=60,
+            # quic_logger=QuicFileLogger("./"),
         )
+        self._quic: QuicConnection | None = None
+        self._h3: H3Connection | None = None
+        self._events: Dict[int, Deque[H3Event]] = defaultdict(deque)
+        self._handshake_completed = False
 
-    # ByteStream
+    # data flow
 
-    async def __aiter__(self) -> AsyncIterator[bytes]:
-        while True:
-            data = await self._queue.get()
-            self._queue.task_done()
-            if not data:
-                break
-            yield data
+    async def _flush(self) -> None:
+        if self._quic is None:
+            return
 
-    async def aclose(self) -> None:
-        if not self._closed:
-            self._closed = True
-            self._connection._responses.pop(self._stream_id)
+        async with self._write_lock:
+            for data, addr in self._quic.datagrams_to_send(now=time.monotonic()):
+                await self._network_stream.write(data)
 
+        # TODO: handle quic timer
 
-class ConnectionProtocol(QuicConnectionProtocol):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    async def _read_quic_event(self) -> None:
+        """Read exactly one incoming quic event."""
+        if self._quic is None:
+            return
 
-        self._http = H3Connection(self._quic)
+        async with self._read_lock:
+            while True:
+                if event := self._quic.next_event():
+                    if isinstance(event, quic_events.HandshakeCompleted):
+                        self._handshake_completed = True
+                    else:
+                        for h3_event in self._h3.handle_event(event):
+                            if isinstance(h3_event, (HeadersReceived, DataReceived)):
+                                self._events[h3_event.stream_id].append(h3_event)
+                    break
 
-        self._responses: Dict[int, HTTP3ResponseHandler] = {}
-        # self._websockets: Dict[int, WebSocket] = {}
+                data = await self._network_stream.read(0)
+                self._quic.receive_datagram(data, self._addr, now=time.monotonic())
+                await self._flush()
 
-    def has_streams(self) -> bool:
-        return bool(self._responses)
+    async def _receive_stream_h3_event(self, stream_id: int) -> H3Event:
+        """Get next H3 event for the stream, read quic events until one is received."""
+        while not self._events.get(stream_id):
+            await self._read_quic_event()
+        return self._events[stream_id].popleft()
 
-    def http_event_received(self, event: H3Event) -> None:
-        # logger.info("h3 event %s", event)
+    # send request
 
-        if isinstance(event, (HeadersReceived, DataReceived)):
-            stream_id = event.stream_id
-            if stream_id in self._responses:
-                response = self._responses[stream_id]
-                response.http_event_received(event)
-
-            # elif stream_id in self._websockets:
-            #     # websocket
-            #     # websocket = self._websockets[stream_id]
-            #     # websocket.http_event_received(event)
-            #     # TODO: WebSockets
-            #     pass
-
-    def quic_event_received(self, event: QuicEvent) -> None:
-        # logger.info("quic event %s", event)
-
-        if self._http is not None:
-            for http_event in self._http.handle_event(event):
-                self.http_event_received(http_event)
-
-    async def handle_async_request(self, request: Request) -> Response:
-        stream_id = self._quic.get_next_available_stream_id()
-
-        # Only async client is supported.
-        # assert isinstance(request.stream, AsyncIterable[bytes])
-
-        response = HTTP3ResponseHandler(self, stream_id)
-        self._responses[stream_id] = response
-
-        content_iter = request.stream.__aiter__()
-        try:
-            next_data_chunk: bytes | None = await content_iter.__anext__()
-        except StopAsyncIteration:
-            next_data_chunk = None
-
+    async def _write_headers(self, stream_id: int, request: Request) -> None:
         # In HTTP/3 the ':authority' pseudo-header is used instead of 'Host'.
         # In order to gracefully handle HTTP/1.1 and HTTP/3 we always require
         # HTTP/1.1 style headers, and map them appropriately if we end up on
@@ -172,73 +146,92 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 )
             ),
         ]
-
-        logger.info("request headers: %s", headers)
-        self._http.send_headers(
-            stream_id=stream_id,
-            headers=headers,
-            end_stream=next_data_chunk is None,
+        end_stream = any(
+            k.lower() == b"content-length" or k.lower() == b"transfer-encoding"
+            for k, v in request.headers
         )
-        self.transmit()
+        self._h3.send_headers(stream_id, headers, end_stream=end_stream)
 
-        # Stream data
+        await self._flush()
+
+    async def _write_body(self, stream_id: int, request: Request) -> None:
+        content_iter = request.stream.__aiter__()
+        try:
+            next_data_chunk: bytes | None = await content_iter.__anext__()
+        except StopAsyncIteration:
+            return
+
         while next_data_chunk:
             data_chunk = next_data_chunk
             next_data_chunk = await content_iter.__anext__()
-            self._http.send_data(
+            self._h3.send_data(
                 stream_id=stream_id, data=data_chunk, end_stream=next_data_chunk is None
             )
-            self.transmit()
+            await self._flush()
 
-        return await response.build()
+    # receive response
 
+    async def _read_headers(self, stream_id: int) -> Tuple[int, Dict[bytes, bytes]]:
+        while True:
+            event = await self._receive_stream_h3_event(stream_id)
+            if isinstance(event, HeadersReceived):
+                break
 
-class AsyncHTTP3Connection(AsyncConnectionInterface):
-    def __init__(
-        self,
-        origin: Origin,
-        stream: AsyncNetworkStream,
-        keepalive_expiry: float | None = None,
-    ):
-        self._origin = origin
-        self._network_stream = stream
-        self._keepalive_expiry: float | None = keepalive_expiry
-        self._state = HTTPConnectionState.IDLE
-        self._expire_at: float | None = None
-        self._request_count = 0
+        status = 200
+        headers = {}
+        for k, v in event.headers:
+            if k == b":status":
+                status = int(v)
+            if not k.startswith(b":"):
+                headers[k] = v
 
-        self._protocol: ConnectionProtocol | None = None
+        return (status, headers)
 
-        self._quic_conifuration = QuicConfiguration(
-            is_client=True,
-            alpn_protocols=H3_ALPN,
-            congestion_control_algorithm="reno",
-            original_version=QuicProtocolVersion.VERSION_1,
-            supported_versions=[
-                QuicProtocolVersion.VERSION_1,
-                QuicProtocolVersion.VERSION_2,
-            ],
-            # idle_timeout=60,
-            # quic_logger=QuicFileLogger("./"),
-        )
+    async def _async_iter_body(self, stream_id: int) -> AsyncIterator[bytes]:
+        while True:
+            event = await self._receive_stream_h3_event(stream_id)
+            if isinstance(event, DataReceived):
+                yield event.data
+            if event.stream_ended:
+                break
 
-        self._responses: Dict[int, HTTP3ResponseHandler] = {}
+    # AsyncConnectionInterface
 
     async def handle_async_request(self, request: Request) -> Response:
-        if self._protocol is None:
-            self._connection_context = connect(
-                self._network_stream[0],
-                self._network_stream[1],
-                configuration=self._quic_conifuration,
-                create_protocol=ConnectionProtocol,
-            )
-            self._protocol = await self._connection_context.__aenter__()
+        async with self._connect_lock:
+            if self._quic is None:
+                self._quic = QuicConnection(configuration=self._quic_configuration)
+                self._h3 = H3Connection(self._quic)
+                # TODO: connection addr
+                self._addr = request.url.host
+                self._quic.connect(self._addr, now=time.monotonic())
+                # TODO: Figure out how to do 0-RTT, we might not want to flush just now.
+                await self._flush()
+                while not self._handshake_completed:
+                    await self._read_quic_event()
 
-        return await self._protocol.handle_async_request(request)
+        stream_id = self._quic.get_next_available_stream_id()
+        await self._write_headers(stream_id, request)
+        await self._write_body(stream_id, request)
+        status, headers = await self._read_headers(stream_id)
+
+        # TODO: if stream ended after headers then do `content = None`
+        content = self._async_iter_body(stream_id)
+
+        return Response(
+            status=status,
+            headers=headers,
+            content=content,
+            extensions={
+                "http_version": "HTTP/3",
+                "stream_id": stream_id,
+            },
+        )
 
     async def aclose(self) -> None:
-        if self._protocol is not None:
-            await self._connection_context.__aexit__(None, None, None)
+        if self._quic is not None:
+            self._quic.close()
+            await self._flush()
 
     def info(self) -> str:
         origin = str(self._origin)
@@ -258,7 +251,10 @@ class AsyncHTTP3Connection(AsyncConnectionInterface):
         return self._expire_at is not None and now > self._expire_at
 
     def is_idle(self) -> bool:
-        self._protocol is None or self._protocol.has_streams()
+        try:
+            return not self._read_lock._anyio_lock.locked()
+        except AttributeError:
+            return True
 
     def is_closed(self) -> bool:
         return False

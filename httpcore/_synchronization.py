@@ -186,6 +186,26 @@ class AsyncSemaphore:
         elif self._backend == "asyncio":
             self._anyio_semaphore.release()
 
+from typing import Generic, TypeVar
+T = TypeVar("T")
+
+class AsyncStream(Generic[T]):
+    def __init__(self) -> None:
+        self.backend = ""
+
+    def setup(self) -> None:
+        self._backend = current_async_library()
+        if self._backend == "asyncio":
+            self._anyio_send_stream, self._anyio_receive_stream = anyio.create_memory_object_stream[T]()
+
+    async def send(self, value: T) -> None:
+        if self._backend == "asyncio":
+            await self._anyio_send_stream.send(value)
+
+    async def receive(self) -> T:
+        if self._backend == "asyncio":
+            return await self._anyio_receive_stream.receive()
+
 
 class AsyncShieldCancellation:
     # For certain portions of our codebase where we're dealing with
