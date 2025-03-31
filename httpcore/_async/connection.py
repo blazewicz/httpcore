@@ -5,6 +5,7 @@ import logging
 import ssl
 import types
 import typing
+import re
 
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
@@ -14,7 +15,7 @@ from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
 from .http11 import AsyncHTTP11Connection
-from .interfaces import AsyncConnectionInterface
+from .interfaces import AsyncConnectionInterface, HTTP3ConnectionError, HTTPAlternativeServices
 
 RETRIES_BACKOFF_FACTOR = 0.5  # 0s, 0.5s, 1s, 2s, 4s, etc.
 
@@ -43,6 +44,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         keepalive_expiry: float | None = None,
         http1: bool = True,
         http2: bool = False,
+        http3: bool = False,
         retries: int = 0,
         local_address: str | None = None,
         uds: str | None = None,
@@ -54,6 +56,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         self._keepalive_expiry = keepalive_expiry
         self._http1 = http1
         self._http2 = http2
+        self._http3 = http3
         self._retries = retries
         self._local_address = local_address
         self._uds = uds
@@ -62,6 +65,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
             AutoBackend() if network_backend is None else network_backend
         )
         self._connection: AsyncConnectionInterface | None = None
+        self._fallback_connection: AsyncConnectionInterface | None = None
         self._connect_failed: bool = False
         self._request_lock = AsyncLock()
         self._socket_options = socket_options
@@ -75,6 +79,15 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         try:
             async with self._request_lock:
                 if self._connection is None:
+                    # if self._http3 and self._htt3_announced():
+                    #     from .http3 import AsyncHTTP3Connection
+
+                    #     self._connection = AsyncHTTP3Connection(
+                    #         origin=self._origin,
+                    #         stream=stream,
+                    #         keepalive_expiry=self._keepalive_expiry,
+                    #     )
+
                     stream = await self._connect(request)
 
                     ssl_object = stream.get_extra_info("ssl_object")
@@ -100,7 +113,43 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
             self._connect_failed = True
             raise exc
 
-        return await self._connection.handle_async_request(request)
+        while True:
+            try:
+                response = await self._connection.handle_async_request(request)
+                # TODO: Verify if we should close the fallback or keep it open in case QUIC fails.
+                if self._fallback_connection:
+                    await self._fallback_connection.aclose()
+                    self._fallback_connection = None
+                return response
+            except HTTP3ConnectionError:
+                # If QUIC fails we fallback to HTTP/2
+                if self._fallback_connection:
+                    await self._connection.aclose()
+                    self._connection = self._fallback_connection
+                    continue
+                else:
+                    raise RuntimeError("HTTP/3 connection failed while HTTP/2 connection is already closed")
+            except HTTPAlternativeServices as altsvc:
+                m_h3 = re.match(rb"h3?=\".*?:(\d+)\"", altsvc.field_value)
+                # m_h3 = re.match(rb"h3(?:-27|-29)?=\".*?:(\d+)\"", altsvc.field_value)
+                if m_h3 and self._http3:
+                    from .http3 import AsyncHTTP3Connection
+
+                    if not isinstance(self._connection, AsyncHTTP3Connection):
+                        self._fallback_connection = self._connection
+
+                        # TODO: Take host from altsvc, if provided
+                        host = self._origin.host.decode("ascii")
+                        port = int(m_h3.group(1))
+                        # stream = await self._network_backend.connect_udp(host, port)
+                        stream = (host, port)
+                        self._connection = AsyncHTTP3Connection(
+                            origin=self._origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+
+                return altsvc.response
 
     async def _connect(self, request: Request) -> AsyncNetworkStream:
         timeouts = request.extensions.get("timeout", {})
@@ -112,6 +161,16 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
 
         while True:
             try:
+                # if self._http3 and not self._http2 and not self._http1:
+                #     kwargs = {
+                #         "host": self._origin.host.decode("ascii"),
+                #         "port": self._origin.port,
+                #         "local_address": self._local_address,
+                #         "timeout": timeout,
+                #     }
+                #     async with Trace("connect_tcp", logger, request, kwargs) as trace:
+                #         stream = await self._network_backend.connect_udp(**kwargs)
+                #         trace.return_value = stream
                 if self._uds is None:
                     kwargs = {
                         "host": self._origin.host.decode("ascii"),

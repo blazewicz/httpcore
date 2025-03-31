@@ -17,6 +17,18 @@ from .._models import (
 )
 
 
+class HTTP3ConnectionError(RuntimeError):
+    pass
+
+
+class HTTPAlternativeServices(Exception):
+    """RFC7838 Alternative Service annoucement received with the response."""
+
+    def __init__(self, field_value: bytes, response: Response) -> None:
+        self.field_value = field_value
+        self.response = response
+
+
 class AsyncRequestInterface:
     async def request(
         self,

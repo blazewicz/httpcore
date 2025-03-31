@@ -97,5 +97,14 @@ class AsyncNetworkBackend:
     ) -> AsyncNetworkStream:
         raise NotImplementedError()  # pragma: nocover
 
+    async def connect_udp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+    ) -> AsyncNetworkStream:
+        raise NotImplementedError()  # pragma: nocover
+
     async def sleep(self, seconds: float) -> None:
         raise NotImplementedError()  # pragma: nocover

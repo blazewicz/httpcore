@@ -37,6 +37,9 @@ dependencies = [
 http2 = [
     "h2>=3,<5",
 ]
+http3 = [
+    "aioquic>=1.2.0",
+]
 socks = [
     "socksio==1.*",
 ]

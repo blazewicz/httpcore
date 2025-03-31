@@ -21,7 +21,7 @@ from .._exceptions import (
 from .._models import Origin, Request, Response
 from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
 from .._trace import Trace
-from .interfaces import AsyncConnectionInterface
+from .interfaces import AsyncConnectionInterface, HTTPAlternativeServices
 
 logger = logging.getLogger("httpcore.http2")
 
@@ -152,7 +152,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 )
                 trace.return_value = (status, headers)
 
-            return Response(
+            response = Response(
                 status=status,
                 headers=headers,
                 content=HTTP2ConnectionByteStream(self, request, stream_id=stream_id),
@@ -185,6 +185,12 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 raise LocalProtocolError(exc)  # pragma: nocover
 
             raise exc
+        else:
+            for header in headers:
+                if header[0].lower() == b"alt-svc":
+                    raise HTTPAlternativeServices(header[1], response)
+
+            return response
 
     async def _send_connection_init(self, request: Request) -> None:
         """
@@ -290,13 +296,21 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         """
         Return the response status code and headers for a given stream ID.
         """
+        headers = []
+
         while True:
             event = await self._receive_stream_event(request, stream_id)
+            logger.info("Received h2 event: %s", event)
+            if isinstance(event, h2.events.AlternativeServiceAvailable):
+                # RFC7838 4. ALTSVC and Alt-Svc are semantically equivalent,
+                # therefore it would be *unwise* if the server would send both.
+                # For HTTP/2 connections server *should* only use ALTSVC frame.
+                if event.field_value:
+                    headers.append(b"alt-svc", event.field_value)
             if isinstance(event, h2.events.ResponseReceived):
                 break
 
         status_code = 200
-        headers = []
         assert event.headers is not None
         for k, v in event.headers:
             if k == b":status":
@@ -326,7 +340,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
     async def _receive_stream_event(
         self, request: Request, stream_id: int
-    ) -> h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded:
+    ) -> h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded | h2.events.AlternativeServiceAvailable:
         """
         Return the next available event for a given stream ID.
 
@@ -370,6 +384,9 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                             await self._receive_remote_settings_change(event)
                             trace.return_value = event
 
+                    elif isinstance(event, h2.events.AlternativeServiceAvailable):
+                        logger.info("ALTSVC received: %s", event)
+
                     elif isinstance(
                         event,
                         (
@@ -377,6 +394,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                             h2.events.DataReceived,
                             h2.events.StreamEnded,
                             h2.events.StreamReset,
+                            h2.events.AlternativeServiceAvailable,
                         ),
                     ):
                         if event.stream_id in self._events:
@@ -407,6 +425,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                     self._max_streams -= 1
 
     async def _response_closed(self, stream_id: int) -> None:
+        # XXX: Is this even called? HTTP3 tests show that it is not.
         await self._max_streams_semaphore.release()
         del self._events[stream_id]
         async with self._state_lock:

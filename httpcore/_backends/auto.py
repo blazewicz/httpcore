@@ -47,6 +47,21 @@ class AutoBackend(AsyncNetworkBackend):
             path, timeout=timeout, socket_options=socket_options
         )
 
+    async def connect_udp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+    ) -> AsyncNetworkStream:
+        await self._init_backend()
+        return await self._backend.connect_udp(
+            host,
+            port,
+            timeout,
+            local_address,
+        )
+
     async def sleep(self, seconds: float) -> None:  # pragma: nocover
         await self._init_backend()
         return await self._backend.sleep(seconds)
